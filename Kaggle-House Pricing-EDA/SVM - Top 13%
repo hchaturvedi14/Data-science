@@ -1,0 +1,41 @@
+library(e1071)
+
+train <- read.csv("~/Downloads/train (3).csv", stringsAsFactors = F)
+test <- read.csv("~/Downloads/test (3).csv", stringsAsFactors = F)
+full <- bind_rows(train,test)
+full %>% str()
+
+SalePrice <- train$SalePrice
+Id <- test$Id
+
+full[,c('Id','SalePrice')] <- NULL
+rm(train,test)
+
+chr <- full[,sapply(full,is.character)]
+int <- full[,sapply(full,is.integer)]
+
+fill_chr <- function(df){
+  for(i in 1:ncol(df)){
+    for(j in 1:nrow(df)){
+      if(is.na(df[j,i])){
+        df[j,i] = "Not Avaiable"
+      }
+    } 
+  } 
+  return(df)
+}
+chr <- fill_chr(chr)
+fac <- chr %>% lapply(as.factor) %>% as.data.frame()
+
+full <- bind_cols(fac,int)
+micemod <- full %>% mice(method='rf')
+full <- complete(micemod)
+
+rm(chr,fac,int,fill_chr,micemod)
+
+train <- full[1:length(SalePrice),]
+test<-full[(length(SalePrice)+1):nrow(full),]
+
+svm_model<-svm(SalePrice~.,data=train, cost = 3)
+svm_pred <- predict(svm_model,newdata = test)
+solution <- data.frame(Id=Id,SalePrice=svm_pred)
