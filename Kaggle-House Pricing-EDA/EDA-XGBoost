@@ -1,0 +1,763 @@
+# As Carly Fiorina said "The goal is to turn data into information, and information into insight." best explains Exploratory data analysis.
+# 
+require(ggplot2)
+require(polycor)
+require(reshape2)
+require(caret)
+require(gridExtra)
+require(scales)
+require(Rmisc)
+require(ggrepel)
+require(Metrics)
+require(xgboost)
+require(moments)
+require(corrplot)
+require(mice)
+require(dplyr)
+require(kernlab)
+require(data.table)
+
+options(scipen=1000000)
+options(max.print=1000000)
+#To read data
+train <- read.csv("../input/train.csv", stringsAsFactors = F)
+test <- read.csv("../input/test.csv", stringsAsFactors = F)
+
+#Very first thing I do after reading data is to use summary and str functions. It gives me basic idea of variables and if there are missing values.
+str(train)
+summary(train)
+#There are 81 variables including SalePrice which is the target variable here. In first glimpse I can see Id do not have any impact on
+#SalePrice hence we can remove it. 
+#Also,some variables have missing values but will deal with these missing values only if the variables are significant in predicting SalePrice.
+#For the SalePrice the median value and maximum value are far apart than min and median this hints for possibleskewness in SalePrice.
+#We got to know a lot from summary
+
+#Confirming skewness
+x<- train$SalePrice
+h<-hist(x,breaks=40, col="orange",xlab ="SalePrice",
+        main="Histogram with Normal Curve")
+xfit<-seq(min(x),max(x),length=40)
+yfit<-dnorm(xfit,mean(x),sd=sd(x))
+yfit<-yfit*diff(h$mids[1:2])*length(x)
+lines(xfit,yfit,col="blue",lwd=3)
+
+skewness(train$SalePrice)
+
+#SalePrice is heavily right skewed,showing people can buy really expensive houses. For beginners skewness shows lack of symmetry in data.
+#Normal data is supposed to be symmetric with a skewness of 0.
+#As most of the theorems works well for normal data so we have to transform SalePrice in normal form.
+#One of the easier ways to do this is to use log transformation.In data preprocessing will transform SalePrice.
+
+#correlation - lets figure out what all variables have high correlation
+numericV <- which(sapply(train, is.numeric)) 
+cor(train$SalePrice,train[,numericV])
+#visualization of high correlated variables
+numVar <- train[, numericV]
+corpairnumVar <- cor(numVar, use="pairwise.complete.obs")
+cor_sorted <- as.matrix(sort(corpairnumVar[,'SalePrice'], decreasing = TRUE))
+varhighcor <- names(which(apply(cor_sorted, 1, function(x) abs(x)>0.5)))
+corpairnumVar <- corpairnumVar[varhighcor, varhighcor]
+corrplot.mixed(corpairnumVar,addCoef.col = "maroon", tl.col="maroon", tl.pos = "lt", plotCI = c("n"), )
+
+#OverallQual,YearBuilt,YearRemodAdd,TotalBsmtSF,X1stFlrSF,GrLivArea,FullBath,GarageCars,GarageArea and TotRmsAbvGrd are strongly correlated
+#with SalePrice. Also, positive correlation.
+#correlation plot also provide details about multicollinearity. If two or more variables are very highly correlated such that by one of the variable other can be estimated
+#then will keep only one of these(whichever have higher correlation with SalePrice). 
+#Here GarageArea and GarageCars are strongly correlated. Similarly TotalBsmtSF and X1stFlrSF,TotRmsAbvGrd and GrLivArea are strongly correlated.
+
+train$GarageArea <- NULL
+train$X1stFlrSF <- NULL
+train$TotRmsAbvGrd <- NULL
+
+#Analysing variable which have high correlation with SalePrice
+ggplot(train, aes(x=GrLivArea, y=SalePrice)) + 
+  geom_point(
+    color="red",
+    fill="blue",
+    shape=21,
+    alpha=0.5,
+    size=2,
+    stroke = .4
+  )
+#GrLivArea - SalePrice increases with GrLivArea. There are few points afte 4500 GrLivArea which do not follow the data distributon pattern
+#and can be classified as outlier. Points above 600000 SalePrice are also outside traffic but they do follow data pattern hence can not
+#be classified as outliers
+#deleting outliers GrLivArea
+train <- train[-c(524, 1299),]
+
+#overall quality - Its value ranges from 1 to 10. Below is the visualization at different levels.
+ggplot(train, aes(x=factor(OverallQual), y=SalePrice)) + 
+  geom_point(
+    color="red",
+    fill="blue",
+    shape=21,
+    alpha=0.5,
+    size=3,
+    stroke = 1
+  )+labs(x='Overall Quality')
+#YearBuilt- As expected SalePrice is more for recently built homes. No outlier.
+ggplot(train, aes(x=factor(YearBuilt), y=SalePrice)) + 
+  geom_point(
+    color="red",
+    fill="blue",
+    shape=21,
+    alpha=0.5,
+    size=2,
+    stroke = .2
+  )+
+  scale_x_discrete(breaks= seq(1872, 2010, by=30)) 
+#Missing values - In numeric variables LotFrontage has 259 missing values,MasVnrArea has 8 missing values, GarageYrBlt has 81 missing values.
+#If the missing value is less than 10% of overal data I will simply delete it. If missing data is huge but that variable is 
+#insignificant in prediction of SalePrice then set the variable to null. For all other cases will impute the missing data.
+
+#MasVnrArea :  .4775 correlated with SalePrice but missing data is only .5% so we can simply delete the rows.
+#hetcor(train$MasVnrArea,train$SalePrice)
+#to find row's Ids
+
+for (i in 1:nrow(train))
+{
+  if(is.na(train$MasVnrArea[i]))
+  {
+    print(train$Id[i])
+    train<-train[-c(i),]
+  }
+}
+
+#LotFrontage : best imputation will be median per Neighborhood. 
+#hetcor(train$LotFrontage,train$SalePrice) 
+for (i in 1:nrow(train))
+{
+  if(is.na(train$LotFrontage[i]))
+  {
+    train$LotFrontage[i]<-
+      median(train$LotFrontage[train$Neighborhood==train$Neighborhood[i]], na.rm=TRUE)
+  }
+}
+
+#Checking what all non-numeric variables have NAs and percentage of missing data.
+
+misscols<-sapply(train, function(x)all(any(is.na(x))))
+colswithmiss <-names(misscols[misscols>0]);
+x = data.frame(train[,colswithmiss])
+PercentMissingData<-apply(x, 2, function(col)sum(is.na(col))/length(col))
+missing.char<-as.data.table(PercentMissingData,keep.rownames = "Column")
+print(missing.char)
+
+#MiscFeature has 96% of data missing,Fence has near to 81% missing,PoolQC has 99% missing and Alley has around 94% missing. 
+#I prefer to set these column to null. Though PoolQC and Alley has strong correlation with SalePrice but imputing
+#94% of data can make the data more biased.
+train$MiscFeature <- NULL 
+train$Fence <- NULL 
+train$PoolQC <- NULL 
+train$Alley <- NULL 
+
+#MSZoning is a category variable like many other in dataset. I will be converting most of these category variable
+#into dummy variable and then will set the original variable to null. If a variable has negligible impact on SalePrice then I can simply
+#set it to null. 
+hetcor(train$SalePrice,as.factor(train$MSZoning))
+train$zone[train$MSZoning %in% c("FV")] <- 4
+train$zone[train$MSZoning %in% c("RL")] <- 3
+train$zone[train$MSZoning %in% c("RH","RM")] <- 2
+train$zone[train$MSZoning %in% c("C (all)")] <- 1
+train$MSZoning <- NULL 
+
+#Street can be easily converted to integer value. Street has a .32 correlation value with SalePrice
+train$dummy.street[train$Street == "Pave"] <- 1
+train$dummy.street[train$Street != "Pave"] <- 0
+train$Street <- NULL
+#LotShape 
+hetcor(train$SalePrice,as.factor(train$LotShape))
+#train$LotShape<-as.integer(revalue(train$LotShape, c('IR3'=0, 'IR2'=1, 'IR1'=2, 'Reg'=3)))
+train$dummy.lotshape[train$LotShape == "Reg"] <- 1
+train$dummy.lotshape[train$LotShape != "Reg"] <- 0
+train$LotShape <- NULL
+#LandContour : very weak correlation with SalePrice. I will set this variable to null.
+hetcor(train$SalePrice,as.factor(train$LandContour))
+train$LandContour <- NULL
+#Utilities creating dummy variable and setting Utilities to null
+hetcor(train$SalePrice,as.factor(train$Utilities))
+train$dummy.util[train$Utilities == "AllPub"] <- 1
+train$dummy.util[train$Utilities != "AllPub"] <- 0
+train$Utilities <- NULL 
+
+#MSSubClass is not a number but categorical variable.
+subclassprice <- summarize(group_by(train, MSSubClass),
+                           mean(SalePrice, na.rm=T))
+train$dummy.subclass[(train$MSSubClass == 60)| (train$MSSubClass == 120)] <- 3
+train$dummy.subclass[(train$MSSubClass == 20)| (train$MSSubClass == 40) | (train$MSSubClass == 50) | (train$MSSubClass == 70)] <- 2
+train$dummy.subclass[(train$MSSubClass == 75)| (train$MSSubClass == 80) | (train$MSSubClass == 85)] <- 2
+train$dummy.subclass[(train$MSSubClass == 30)| (train$MSSubClass == 45) | (train$MSSubClass == 90)] <- 1
+train$dummy.subclass[(train$MSSubClass == 160)| (train$MSSubClass == 180) | (train$MSSubClass == 190)] <- 1
+
+train$MSSubClass <- NULL
+#LotConfig is a categorical variable with a weak correlation with SalePrice. I am creating dummy variable but I can also set the variable to null.
+train$dummy.lot[train$LotConfig %in% c("CulDSac", "FR3")] <- 1
+train$dummy.lot[!train$LotConfig %in% c("CulDSac", "FR3")] <- 0
+
+train$LotConfig  <- NULL
+#LandSlope :LotConfig is a categorical variable with a weak correlation with SalePrice. Can be set to NULL.
+train$LandSlope<-as.integer(revalue(train$LandSlope, c('Sev'=0, 'Mod'=1, 'Gtl'=2)))
+#Neighborhood can decide the price of a house. If the avaerage house price is high in the area then it will increase the house price.
+#I have used quartiles and SalePrice distribution to decide what can be low/medium and high SalePrice 
+nbhdprice <- summarize(group_by(train, Neighborhood),
+                       mean(SalePrice, na.rm=T))
+
+low.nbhdprice <- filter(nbhdprice, nbhdprice$`mean(SalePrice, na.rm = T)` < 140000)
+mid.nbhdprice <- filter(nbhdprice, nbhdprice$`mean(SalePrice, na.rm = T)` < 200000 &
+                          nbhdprice$`mean(SalePrice, na.rm = T)` >= 140000 )
+high.nbhdprice <- filter(nbhdprice, nbhdprice$`mean(SalePrice, na.rm = T)` >= 200000)
+
+train$nhbd.price[train$Neighborhood %in% low.nbhdprice$Neighborhood] <- 1
+train$nhbd.price[train$Neighborhood %in% mid.nbhdprice$Neighborhood] <- 2
+train$nhbd.price[train$Neighborhood %in% high.nbhdprice$Neighborhood] <- 3
+
+train$Neighborhood <- NULL 
+
+#Condition1: I am assigning value you can also convert it into factor
+condprice<-summarize(group_by(train, Condition1),
+                     mean(SalePrice, na.rm=T))
+
+low.condprice <- filter(condprice, condprice$`mean(SalePrice, na.rm = T)` < 140000)
+mid.condprice <- filter(condprice, condprice$`mean(SalePrice, na.rm = T)` < 200000 &
+                          condprice$`mean(SalePrice, na.rm = T)` >= 140000 )
+high.condprice <- filter(condprice, condprice$`mean(SalePrice, na.rm = T)` >= 200000)
+
+train$cond1.price[train$Condition1 %in% low.condprice$Condition1] <- 1
+train$cond1.price[train$Condition1 %in% mid.condprice$Condition1] <- 2
+train$cond1.price[train$Condition1 %in% high.condprice$Condition1] <- 3
+
+train$Condition1 <- NULL 
+
+#Condition2
+cond2price<-summarize(group_by(train, Condition2),
+                      mean(SalePrice, na.rm=T))
+
+low.cond2price <- filter(cond2price, cond2price$`mean(SalePrice, na.rm = T)` < 140000)
+mid.cond2price <- filter(cond2price, cond2price$`mean(SalePrice, na.rm = T)` < 200000 &
+                           cond2price$`mean(SalePrice, na.rm = T)` >= 140000 )
+high.cond2price <- filter(cond2price, cond2price$`mean(SalePrice, na.rm = T)` >= 200000)
+
+train$cond2.price[train$Condition2 %in% low.cond2price$Condition2] <- 1
+train$cond2.price[train$Condition2 %in% mid.cond2price$Condition2] <- 2
+train$cond2.price[train$Condition2 %in% high.cond2price$Condition2] <- 3
+
+train$Condition2 <- NULL 
+#BldgType 
+train$dummy.bldg[train$BldgType %in% c("1Fam", "TwnhsE")] <- 1
+train$dummy.bldg[!train$BldgType %in% c("1Fam", "TwnhsE")] <- 0     
+train$BldgType<- NULL 
+#HouseStyle          
+hstylprice<-summarize(group_by(train, HouseStyle),
+                      mean(SalePrice, na.rm=T))
+low.hstylprice <- filter(hstylprice, hstylprice$`mean(SalePrice, na.rm = T)` < 140000)
+mid.hstylprice <- filter(hstylprice, hstylprice$`mean(SalePrice, na.rm = T)` < 200000 &
+                           hstylprice$`mean(SalePrice, na.rm = T)` >= 140000 )
+high.hstylprice <- filter(hstylprice, hstylprice$`mean(SalePrice, na.rm = T)` >= 200000)
+
+train$dummy.house[train$HouseStyle %in% low.hstylprice$HouseStyle] <- 1
+train$dummy.house[train$HouseStyle %in% mid.hstylprice$HouseStyle] <- 2
+train$dummy.house[train$HouseStyle %in% high.hstylprice$HouseStyle] <- 3 
+
+train$HouseStyle<- NULL 
+#RoofStyle
+train$dummy.roofst[train$RoofStyle %in% c("Hip", "Shed")] <- 1
+train$dummy.roofst[!train$RoofStyle %in% c("Hip", "Shed")] <- 0
+train$RoofStyle<- NULL
+#RoofMatl
+#nbhdprice<-summarize(group_by(train, RoofMatl),
+#          mean(SalePrice, na.rm=T))
+train$dummy.roofst[train$RoofMatl %in% c("Membran", "WdShake", "WdShngl")] <- 1
+train$dummy.roofst[!train$RoofMatl %in% c("Membran", "WdShake", "WdShngl")] <- 0
+train$RoofMatl<- NULL
+#Exterior1st
+ext1price<-summarize(group_by(train, Exterior1st),
+                     mean(SalePrice, na.rm=T))
+low.ext1price <- filter(ext1price, ext1price$`mean(SalePrice, na.rm = T)` < 140000)
+mid.ext1price <- filter(ext1price, ext1price$`mean(SalePrice, na.rm = T)` < 200000 &
+                          ext1price$`mean(SalePrice, na.rm = T)` >= 140000 )
+high.ext1price <- filter(ext1price, ext1price$`mean(SalePrice, na.rm = T)` >= 200000)
+
+train$dummy.extr1[train$Exterior1st %in% low.ext1price$Exterior1st] <- 1
+train$dummy.extr1[train$Exterior1st %in% mid.ext1price$Exterior1st] <- 2
+train$dummy.extr1[train$Exterior1st %in% high.ext1price$Exterior1st] <- 3 
+train$Exterior1st<- NULL
+#
+ext2price<-summarize(group_by(train, Exterior2nd),
+                     mean(SalePrice, na.rm=T))
+low.ext2price <- filter(ext2price, ext2price$`mean(SalePrice, na.rm = T)` < 140000)
+mid.ext2price <- filter(ext2price, ext2price$`mean(SalePrice, na.rm = T)` < 200000 &
+                          ext2price$`mean(SalePrice, na.rm = T)` >= 140000 )
+high.ext2price <- filter(ext2price, ext2price$`mean(SalePrice, na.rm = T)` >= 200000)
+
+train$dummy.extr2[train$Exterior2nd %in% low.ext2price$Exterior2nd] <- 1
+train$dummy.extr2[train$Exterior2nd %in% mid.ext2price$Exterior2nd] <- 2
+train$dummy.extr2[train$Exterior2nd %in% high.ext2price$Exterior2nd] <- 3 
+train$Exterior2nd<- NULL
+#MasVnrArea: Above I have calculated % missing data(blv line 178 - missing.char), as missing data is a small fraction so will remove it.
+#train$MasVnrArea[is.na(train$MasVnrArea)] <- 0
+#MasVnrType : below code will take care of NA's too
+#nbhdprice<-summarize(group_by(train, MasVnrType),
+#          mean(SalePrice, na.rm=T))
+train$dummy.mastype[train$MasVnrType %in% c("Stone", "BrkFace") | is.na(train$MasVnrType)] <- 1
+train$dummy.mastype[!train$MasVnrType %in% c("Stone", "BrkFace") & !is.na(train$MasVnrType)] <- 0
+train$MasVnrType <- NULL
+#ExterQual : 
+train$dummy.extqual[train$ExterQual == "Ex"] <- 4
+train$dummy.extqual[train$ExterQual == "Gd"] <- 3
+train$dummy.extqual[train$ExterQual == "TA"] <- 2
+train$dummy.extqual[train$ExterQual == "Fa"] <- 1
+train$ExterQual <- NULL
+#ExterCond
+train$dummy.extcond[train$ExterCond == "Ex"] <- 5
+train$dummy.extcond[train$ExterCond == "Gd"] <- 4
+train$dummy.extcond[train$ExterCond == "TA"] <- 3
+train$dummy.extcond[train$ExterCond == "Fa"] <- 2
+train$dummy.extcond[train$ExterCond == "Po"] <- 1
+
+train$ExterCond <- NULL
+#Foundation
+train$dummy.found[train$Foundation == "PConc"] <- 1
+train$dummy.found[train$Foundation != "PConc"] <- 0
+
+train$Foundation <- NULL
+#BsmtQual has 2.5% NA which basically suggests no basement, in this case we can simply give '0' or any lower value to NA. 
+hetcor(train$SalePrice,as.factor(train$BsmtQual))
+train$dummy.bsmt[train$BsmtQual == "Ex"] <- 4
+train$dummy.bsmt[train$BsmtQual == "Gd"] <- 3
+train$dummy.bsmt[train$BsmtQual == "TA"] <- 2
+train$dummy.bsmt[train$BsmtQual == "Fa"] <- 1
+train$dummy.bsmt[is.na(train$BsmtQual)] <- 0
+
+train$BsmtQual <- NULL
+#BsmtFinType1 is -.02 correlated with SalePrice. I will simply set this column to null
+hetcor(train$SalePrice,as.factor(train$BsmtFinType1))
+train$BsmtFinType1 <- NULL
+#BsmtFinType2
+hetcor(train$SalePrice,as.factor(train$BsmtFinType2))
+train$BsmtFinType2 <- NULL
+#Heating
+hetcor(train$SalePrice,as.factor(train$Heating))
+
+#nbhdprice<-summarize(group_by(train, Heating),
+#          mean(SalePrice, na.rm=T))
+
+train$dummy.heat[train$Heating %in% c("GasA", "GasW")] <- 1
+train$dummy.heat[!train$Heating %in% c("GasA", "GasW")] <- 0
+
+train$Heating<- NULL
+#HeatingQC
+hetcor(train$SalePrice,as.factor(train$HeatingQC))
+train$dummy.heatqc[train$HeatingQC == "Ex"] <- 5
+train$dummy.heatqc[train$HeatingQC == "Gd"] <- 4
+train$dummy.heatqc[train$HeatingQC == "TA"] <- 3
+train$dummy.heatqc[train$HeatingQC == "Fa"] <- 2
+train$dummy.heatqc[train$HeatingQC == "Po"] <- 1
+
+train$HeatingQC<- NULL
+#CentralAir
+hetcor(train$SalePrice,as.factor(train$CentralAir))
+train$dummy.air[train$CentralAir == "Y"] <- 1
+train$dummy.air[train$CentralAir == "N"] <- 0
+
+train$CentralAir<- NULL
+#Electrical .06% data is missing below code will impute missing values too
+hetcor(train$SalePrice,as.factor(train$Electrical))
+
+#nbhdprice<-summarize(group_by(train, Electrical),
+#          mean(SalePrice, na.rm=T))
+train$dummy.electric[train$Electrical == "SBrkr" | is.na(train$Electrical)] <- 1
+train$dummy.electric[!train$Electrical == "SBrkr" & !is.na(train$Electrical)] <- 0
+
+train$Electrical<- NULL
+
+#KitchenQual
+hetcor(train$SalePrice,as.factor(train$KitchenQual))
+
+train$dummy.kit[train$KitchenQual == "Ex"] <- 4
+train$dummy.kit[train$KitchenQual == "Gd"] <- 3
+train$dummy.kit[train$KitchenQual == "TA"] <- 2
+train$dummy.kit[train$KitchenQual == "Fa"] <- 1
+train$dummy.kit[train$KitchenQual == "Po"] <- 0
+
+train$KitchenQual<- NULL
+#Functional
+#hetcor(train$SalePrice,as.factor(train$Functional))
+#nbhdprice<-summarize(group_by(train, Functional),
+#          mean(SalePrice, na.rm=T))
+
+train$dummy.func[train$Functional %in% c("Typ", "Mod")] <- 1
+train$dummy.func[!train$Functional %in% c("Typ", "Mod")] <- 0
+
+train$Functional<- NULL
+#FireplaceQu: It has more than 47% missing data and its correlation with SalePrice is also not very strong. I will just set it to null.
+hetcor(train$SalePrice,as.factor(train$FireplaceQu))
+train$FireplaceQu<- NULL  
+#GarageType: less than 6% missing data.  
+test$dummy.gartype[test$GarageType %in% c("Attchd", "BuiltIn")] <- 1
+test$dummy.gartype[!test$GarageType %in% c("Attchd", "BuiltIn")] <- 0
+
+train$GarageType<- NULL   
+#GarageYrBlt :less than 6% missing data.GarageYrBlt and YearBuilt are very strongly correlated. I will set GarageYrBlt to null in order to avoid multicollinearity.
+train$GarageYrBlt<- NULL 
+#GarageFinish : less than 6% missing data. 
+hetcor(train$SalePrice,as.factor(train$GarageFinish))
+train$dummy.garfin[train$GarageFinish %in% c("Fin", "RFn")] <- 1
+train$dummy.garfin[!train$GarageFinish %in% c("Fin", "RFn")] <- 0
+train$GarageFinish<- NULL 
+
+#GarageQual:less than 6% missing data. 
+#hetcor(train$SalePrice,as.factor(train$GarageQual))
+
+train$dummy.garqual[train$GarageQual == "Ex"] <- 5
+train$dummy.garqual[train$GarageQual == "Gd"] <- 4
+train$dummy.garqual[train$GarageQual == "TA"] <- 3
+train$dummy.garqual[train$GarageQual == "Fa"] <- 2
+train$dummy.garqual[train$GarageQual == "Po" | is.na(train$GarageQual)] <- 1
+
+train$GarageQual<- NULL
+#GarageCond and GarageQual are strongly correlated. 
+#hetcor(train$SalePrice,as.factor(train$GarageCond))
+train$GarageCond<- NULL
+#PavedDrive
+#hetcor(train$SalePrice,as.factor(train$PavedDrive))
+train$dummy.paved[train$PavedDrive == "Y"] <- 1
+train$dummy.paved[train$PavedDrive != "Y"] <- 0
+
+train$PavedDrive<- NULL
+#SaleType
+hetcor(train$SalePrice,as.factor(train$SaleType))
+train$dummy.sale[train$SaleType %in% c("New", "Con")] <- 5
+train$dummy.sale[train$SaleType %in% c("CWD", "ConLI")] <- 4
+train$dummy.sale[train$SaleType %in% c("WD")] <- 3
+train$dummy.sale[train$SaleType %in% c("COD", "ConLw", "ConLD")] <- 2
+train$dummy.sale[train$SaleType %in% c("Oth")] <- 1
+
+train$SaleType<- NULL
+#SaleCondition
+#hetcor(train$SalePrice,as.factor(train$SaleCondition))
+#nbhdprice<-summarize(group_by(train, SaleCondition),
+#          mean(SalePrice, na.rm=T))
+train$dummy.salecond[train$SaleCondition %in% c("Partial")] <- 4
+train$dummy.salecond[train$SaleCondition %in% c("Normal", "Alloca")] <- 3
+train$dummy.salecond[train$SaleCondition %in% c("Family","Abnorml")] <- 2
+train$dummy.salecond[train$SaleCondition %in% c("AdjLand")] <- 1
+
+train$SaleCondition<- NULL
+
+summary(train)
+#Thanks to summary have realized that BsmtExposure and BsmtCond are still char. Both have small amount of missing data.
+train$dummy.bsmtexp[train$BsmtExposure == "Gd"] <- 5
+train$dummy.bsmtexp[train$BsmtExposure == "Av"] <- 4
+train$dummy.bsmtexp[train$BsmtExposure == "Mn"] <- 3
+train$dummy.bsmtexp[train$BsmtExposure == "No"] <- 2
+train$dummy.bsmtexp[is.na(train$BsmtExposure)] <- 1
+
+train$BsmtExposure<- NULL
+#BsmtCond
+train$dummy.bsmtcond[train$BsmtCond == "Gd"] <- 5
+train$dummy.bsmtcond[train$BsmtCond == "TA"] <- 4
+train$dummy.bsmtcond[train$BsmtCond == "Fa"] <- 3
+train$dummy.bsmtcond[train$BsmtCond == "Po"] <- 2
+train$dummy.bsmtcond[is.na(train$BsmtCond)] <- 1
+
+train$BsmtCond<- NULL
+##
+train$TotalBsmtSF[is.na(train$TotalBsmtSF)] <- 0
+train$dummy.paved[is.na(train$dummy.paved)] <- 0
+train$dummy.util[is.na(train$dummy.util)] <- 0
+
+#####Need to repeat same Process for test data. 
+test$GarageArea <- NULL
+test$X1stFlrSF <- NULL
+test$TotRmsAbvGrd <- NULL
+for (i in 1:nrow(test))
+{
+  if(is.na(test$LotFrontage[i]))
+  {
+    test$LotFrontage[i]<-
+      median(test$LotFrontage[test$Neighborhood==test$Neighborhood[i]], na.rm=TRUE)
+  }
+}
+test$MiscFeature <- NULL 
+test$Fence <- NULL 
+test$PoolQC <- NULL 
+test$Alley <- NULL 
+test$zone[test$MSZoning %in% c("FV")] <- 4
+test$zone[test$MSZoning %in% c("RL")] <- 3
+test$zone[test$MSZoning %in% c("RH","RM")] <- 2
+test$zone[test$MSZoning %in% c("C (all)")] <- 1
+test$MSZoning <- NULL 
+test$dummy.street[test$Street == "Pave"] <- 1
+test$dummy.street[test$Street != "Pave"] <- 0
+test$Street <- NULL
+test$dummy.lotshape[test$LotShape == "Reg"] <- 1
+test$dummy.lotshape[test$LotShape != "Reg"] <- 0
+test$LotShape <- NULL
+test$LandContour <- NULL
+test$dummy.util[test$Utilities == "AllPub"] <- 1
+test$dummy.util[test$Utilities != "AllPub"] <- 0
+test$Utilities <- NULL 
+test$dummy.subclass[(test$MSSubClass == 60)| (test$MSSubClass == 120)] <- 3
+test$dummy.subclass[(test$MSSubClass == 20)| (test$MSSubClass == 40) | (test$MSSubClass == 50) | (test$MSSubClass == 70)] <- 2
+test$dummy.subclass[(test$MSSubClass == 75)| (test$MSSubClass == 80) | (test$MSSubClass == 85)] <- 2
+test$dummy.subclass[(test$MSSubClass == 30)| (test$MSSubClass == 45) | (test$MSSubClass == 90)] <- 1
+test$dummy.subclass[(test$MSSubClass == 160)| (test$MSSubClass == 180) | (test$MSSubClass == 190)] <- 1
+test$MSSubClass <- NULL
+test$dummy.lot[test$LotConfig %in% c("CulDSac", "FR3")] <- 1
+test$dummy.lot[!test$LotConfig %in% c("CulDSac", "FR3")] <- 0
+test$LotConfig  <- NULL
+test$LandSlope<-as.integer(revalue(test$LandSlope, c('Sev'=0, 'Mod'=1, 'Gtl'=2)))
+test$nhbd.price[test$Neighborhood %in% low.nbhdprice$Neighborhood] <- 1
+test$nhbd.price[test$Neighborhood %in% mid.nbhdprice$Neighborhood] <- 2
+test$nhbd.price[test$Neighborhood %in% high.nbhdprice$Neighborhood] <- 3
+test$Neighborhood <- NULL 
+test$cond1.price[test$Condition1 %in% low.condprice$Condition1] <- 1
+test$cond1.price[test$Condition1 %in% mid.condprice$Condition1] <- 2
+test$cond1.price[test$Condition1 %in% high.condprice$Condition1] <- 3
+test$Condition1 <- NULL 
+
+test$cond2.price[test$Condition2 %in% low.cond2price$Condition2] <- 1
+test$cond2.price[test$Condition2 %in% mid.cond2price$Condition2] <- 2
+test$cond2.price[test$Condition2 %in% high.cond2price$Condition2] <- 3
+test$Condition2 <- NULL 
+
+test$dummy.bldg[test$BldgType %in% c("1Fam", "TwnhsE")] <- 1
+test$dummy.bldg[!test$BldgType %in% c("1Fam", "TwnhsE")] <- 0     
+test$BldgType<- NULL 
+
+test$dummy.house[test$HouseStyle %in% low.hstylprice$HouseStyle] <- 1
+test$dummy.house[test$HouseStyle %in% mid.hstylprice$HouseStyle] <- 2
+test$dummy.house[test$HouseStyle %in% high.hstylprice$HouseStyle] <- 3 
+test$HouseStyle<- NULL 
+
+test$dummy.roofst[test$RoofStyle %in% c("Hip", "Shed")] <- 1
+test$dummy.roofst[!test$RoofStyle %in% c("Hip", "Shed")] <- 0
+test$RoofStyle<- NULL
+
+test$dummy.roofst[test$RoofMatl %in% c("Membran", "WdShake", "WdShngl")] <- 1
+test$dummy.roofst[!test$RoofMatl %in% c("Membran", "WdShake", "WdShngl")] <- 0
+test$RoofMatl<- NULL
+
+test$dummy.extr1[test$Exterior1st %in% low.ext1price$Exterior1st] <- 1
+test$dummy.extr1[test$Exterior1st %in% mid.ext1price$Exterior1st] <- 2
+test$dummy.extr1[test$Exterior1st %in% high.ext1price$Exterior1st] <- 3 
+
+test$Exterior1st<- NULL
+
+test$dummy.extr2[test$Exterior2nd %in% low.ext2price$Exterior2nd] <- 1
+test$dummy.extr2[test$Exterior2nd %in% mid.ext2price$Exterior2nd] <- 2
+test$dummy.extr2[test$Exterior2nd %in% high.ext2price$Exterior2nd] <- 3 
+
+test$Exterior2nd<- NULL
+test$MasVnrArea[is.na(test$MasVnrArea)] <- 0
+
+test$dummy.mastype[test$MasVnrType %in% c("Stone", "BrkFace") | is.na(test$MasVnrType)] <- 1
+test$dummy.mastype[!test$MasVnrType %in% c("Stone", "BrkFace") & !is.na(test$MasVnrType)] <- 0
+test$MasVnrType <- NULL
+test$dummy.extqual[test$ExterQual == "Ex"] <- 4
+test$dummy.extqual[test$ExterQual == "Gd"] <- 3
+test$dummy.extqual[test$ExterQual == "TA"] <- 2
+test$dummy.extqual[test$ExterQual == "Fa"] <- 1
+test$ExterQual <- NULL
+test$dummy.extcond[test$ExterCond == "Ex"] <- 5
+test$dummy.extcond[test$ExterCond == "Gd"] <- 4
+test$dummy.extcond[test$ExterCond == "TA"] <- 3
+test$dummy.extcond[test$ExterCond == "Fa"] <- 2
+test$dummy.extcond[test$ExterCond == "Po"] <- 1
+test$ExterCond <- NULL
+test$dummy.found[test$Foundation == "PConc"] <- 1
+test$dummy.found[test$Foundation != "PConc"] <- 0
+test$Foundation <- NULL
+test$dummy.bsmt[test$BsmtQual == "Ex"] <- 4
+test$dummy.bsmt[test$BsmtQual == "Gd"] <- 3
+test$dummy.bsmt[test$BsmtQual == "TA"] <- 2
+test$dummy.bsmt[test$BsmtQual == "Fa"] <- 1
+test$dummy.bsmt[is.na(test$BsmtQual)] <- 0
+test$BsmtQual <- NULL
+test$BsmtFinType1 <- NULL
+test$BsmtFinType2 <- NULL
+
+test$dummy.heat[test$Heating %in% c("GasA", "GasW")] <- 1
+test$dummy.heat[!test$Heating %in% c("GasA", "GasW")] <- 0
+test$Heating<- NULL
+test$dummy.heatqc[test$HeatingQC == "Ex"] <- 5
+test$dummy.heatqc[test$HeatingQC == "Gd"] <- 4
+test$dummy.heatqc[test$HeatingQC == "TA"] <- 3
+test$dummy.heatqc[test$HeatingQC == "Fa"] <- 2
+test$dummy.heatqc[test$HeatingQC == "Po"] <- 1
+test$HeatingQC<- NULL
+test$dummy.air[test$CentralAir == "Y"] <- 1
+test$dummy.air[test$CentralAir == "N"] <- 0
+test$CentralAir<- NULL
+
+test$dummy.electric[test$Electrical == "SBrkr" | is.na(test$Electrical)] <- 1
+test$dummy.electric[!test$Electrical == "SBrkr" & !is.na(test$Electrical)] <- 0
+test$Electrical<- NULL
+test$dummy.kit[test$KitchenQual == "Ex"] <- 4
+test$dummy.kit[test$KitchenQual == "Gd"] <- 3
+test$dummy.kit[test$KitchenQual == "TA"] <- 2
+test$dummy.kit[test$KitchenQual == "Fa"] <- 1
+test$dummy.kit[test$KitchenQual == "Po"] <- 0
+test$KitchenQual<- NULL
+
+test$dummy.func[test$Functional %in% c("Typ", "Mod")] <- 1
+test$dummy.func[!test$Functional %in% c("Typ", "Mod")] <- 0
+test$Functional<- NULL
+test$FireplaceQu<- NULL  
+test$dummy.gartype[test$GarageType %in% c("Attchd", "BuiltIn")] <- 1
+test$dummy.gartype[!test$GarageType %in% c("Attchd", "BuiltIn")] <- 0
+test$GarageType<- NULL   
+test$dummy.garfin[test$GarageFinish %in% c("Fin", "RFn")] <- 1
+test$dummy.garfin[!test$GarageFinish %in% c("Fin", "RFn")] <- 0
+test$GarageFinish<- NULL 
+test$dummy.garqual[test$GarageQual == "Ex"] <- 5
+test$dummy.garqual[test$GarageQual == "Gd"] <- 4
+test$dummy.garqual[test$GarageQual == "TA"] <- 3
+test$dummy.garqual[test$GarageQual == "Fa"] <- 2
+test$dummy.garqual[test$GarageQual == "Po" | is.na(test$GarageQual)] <- 1
+test$GarageQual<- NULL
+
+test$GarageCond<- NULL
+test$dummy.paved[test$PavedDrive == "Y"] <- 1
+test$dummy.paved[test$PavedDrive != "Y"] <- 0
+
+test$PavedDrive<- NULL
+test$dummy.sale[test$SaleType %in% c("New", "Con")] <- 5
+test$dummy.sale[test$SaleType %in% c("CWD", "ConLI")] <- 4
+test$dummy.sale[test$SaleType %in% c("WD")] <- 3
+test$dummy.sale[test$SaleType %in% c("COD", "ConLw", "ConLD")] <- 2
+test$dummy.sale[test$SaleType %in% c("Oth")] <- 1
+test$SaleType<- NULL
+
+test$dummy.salecond[test$SaleCondition %in% c("Partial")] <- 4
+test$dummy.salecond[test$SaleCondition %in% c("Normal", "Alloca")] <- 3
+test$dummy.salecond[test$SaleCondition %in% c("Family","Abnorml")] <- 2
+test$dummy.salecond[test$SaleCondition %in% c("AdjLand")] <- 1
+test$SaleCondition<- NULL
+#test$Id <- NULL
+test$dummy.bsmtexp[test$BsmtExposure == "Gd"] <- 5
+test$dummy.bsmtexp[test$BsmtExposure == "Av"] <- 4
+test$dummy.bsmtexp[test$BsmtExposure == "Mn"] <- 3
+test$dummy.bsmtexp[test$BsmtExposure == "No"] <- 2
+test$dummy.bsmtexp[is.na(test$BsmtExposure)] <- 1
+test$BsmtExposure<- NULL
+test$dummy.bsmtcond[test$BsmtCond == "Gd"] <- 5
+test$dummy.bsmtcond[test$BsmtCond == "TA"] <- 4
+test$dummy.bsmtcond[test$BsmtCond == "Fa"] <- 3
+test$dummy.bsmtcond[test$BsmtCond == "Po"] <- 2
+test$dummy.bsmtcond[is.na(test$BsmtCond)] <- 1
+test$BsmtCond<- NULL
+test$GarageYrBlt<- NULL
+test$MasVnrArea[is.na(test$MasVnrArea)] <- 0
+test$LotFrontage[is.na(test$LotFrontage)] <- 0
+test$BsmtFinSF1[is.na(test$BsmtFinSF1)] <- 0
+test$BsmtFinSF2[is.na(test$BsmtFinSF2)] <- 0
+test$BsmtUnfSF[is.na(test$BsmtUnfSF)] <- 0
+test$TotalBsmtSF[is.na(test$TotalBsmtSF)] <- 0
+#test$dummy.paved[is.na(test$dummy.paved)] <- 0
+test$dummy.util[is.na(test$dummy.util)] <- 0
+test$dummy.sale[is.na(test$dummy.sale)] <- 0
+test$dummy.kit[is.na(test$dummy.kit)] <- 0
+
+test$dummy.extr1[is.na(test$dummy.extr1)] <- 0
+test$dummy.extr2[is.na(test$dummy.extr2)] <- 0
+test$dummy.subclass[is.na(test$dummy.subclass)] <- 0
+test$zone[is.na(test$zone)] <- 0
+test$BsmtFullBath[is.na(test$BsmtFullBath)] <- 0
+test$BsmtHalfBath[is.na(test$BsmtHalfBath)] <- 0
+test$GarageCars[is.na(test$GarageCars)] <- 0
+
+#####
+
+#Creating Training and Test data sets in order to know which algorithm worked best.
+#removing Id 
+train$Id <- NULL
+train$SalePrice <- log(train$SalePrice)
+partition=sample(nrow(train), 0.75*nrow(train), replace=FALSE)
+dummy.train=train[partition,]
+dummy.test=train[-partition,]
+
+trainDM<- as.matrix(dummy.train, rownames.force=NA)
+testDM<- as.matrix(dummy.test, rownames.force=NA)
+
+trainSM <- as(trainDM, "sparseMatrix")
+testSM <- as(testDM, "sparseMatrix")
+
+vars <- c("LotFrontage","LotArea"     ,  
+          "LandSlope","OverallQual","OverallCond","YearBuilt","YearRemodAdd","MasVnrArea"    ,
+          "BsmtFinSF1","BsmtFinSF2","BsmtUnfSF","TotalBsmtSF","X2ndFlrSF","GrLivArea",
+          "BsmtFullBath","BsmtHalfBath","FullBath","HalfBath","BedroomAbvGr","KitchenAbvGr"     ,
+          "Fireplaces" , "GarageCars","WoodDeckSF","OpenPorchSF","EnclosedPorch", "X3SsnPorch"    ,
+          "ScreenPorch","PoolArea","MiscVal","MoSold","YrSold","zone"   ,
+          "dummy.street","dummy.lotshape","dummy.util","dummy.subclass","dummy.lot","nhbd.price"    ,   
+          "cond1.price","cond2.price","dummy.bldg","dummy.house", "dummy.roofst","dummy.extr1",
+          "dummy.extr2","dummy.mastype","dummy.extcond","dummy.found","dummy.bsmt","dummy.heat",
+          "dummy.heatqc","dummy.air","dummy.electric","dummy.kit","dummy.func","dummy.garfin",
+          "dummy.garqual","dummy.paved","dummy.sale","dummy.salecond","dummy.bsmtexp", "dummy.bsmtcond")
+
+str(train)
+trainDM1 <- xgb.DMatrix(data = trainSM, label = trainSM[,"SalePrice"])
+trainDM2 <- xgb.DMatrix(data = trainSM[,vars], label = trainSM[,"SalePrice"])
+
+cv.sparse <- xgb.cv(data = trainDM2,  #trainDM1
+                    nrounds = 600,
+                    min_child_weight = 0,
+                    max_depth = 10,
+                    eta = 0.02,
+                    subsample = .7,
+                    colsample_bytree = .7,
+                    booster = "gbtree",
+                    eval_metric = "rmse",
+                    verbose = TRUE,
+                    print_every_n = 50,
+                    nfold = 4,
+                    nthread = 2,
+                    objective="reg:linear")
+
+#parameters for the model
+param <- list(colsample_bytree = .7,
+              subsample = .7,
+              booster = "gbtree",
+              max_depth = 10,
+              eta = 0.02,
+              eval_metric = "rmse",
+              objective="reg:linear")
+
+#training model
+mod.sparse <-
+  xgb.train(params = param,
+            data = trainDM2, 
+            nrounds = 600,
+            watchlist = list(train = trainDM2), 
+            verbose = TRUE,
+            print_every_n = 50,
+            nthread = 2)
+#testing
+testDM <- xgb.DMatrix(data =testSM[,vars] ) 
+#prediction
+predic.testDM <- predict(mod.sparse, testDM)
+
+test.comp <- as.data.frame(as.matrix(testSM))
+predic.testDM <- as.data.frame(as.matrix(predic.testDM))
+
+colnames(predic.testDM)<-"prediction"
+model_result <- cbind(test.comp, predic.testDM)
+
+model_result$log_prediction <- log(model_result$prediction)
+model_result$log_SalePrice <- log(model_result$SalePrice)
+
+#str(model_result)
+#Test with RMSE
+rmse(model_result$log_SalePrice,model_result$log_prediction) 
+#Using test data
+testdf <- as.data.frame(test)
+testmt<- as.matrix(testdf, rownames.force=NA)
+testSM1 <- as(testmt, "sparseMatrix")
+predict1 <- predict(mod.sparse, testSM1[,vars])
+predict1 <- exp(predict1) 
+predict1 <- as.data.frame(as.matrix(predict1))
+colnames(predict1) <- "pred_value"
+model_result <- cbind(testdf, predict1)
+submission <- data.frame(Id = model_result$Id, SalePrice = model_result$pred_value)
+length(model_result$pred_value)
+write.csv(submission, file = "submission3.csv", row.names = F)
